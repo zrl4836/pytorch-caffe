@@ -9,9 +9,15 @@ from torch.autograd import Variable
 from torch.autograd import Function
 import torch.nn.functional as F
 from collections import OrderedDict
+
+import sys
+sys.path.append('/home/caffe/python')
 import caffe
 import caffe.proto.caffe_pb2 as caffe_pb2
-from torch.legacy.nn import SpatialCrossMapLRN as SpatialCrossMapLRNOld
+
+# from torch.legacy.nn import SpatialCrossMapLRN as SpatialCrossMapLRNOld
+from torch.nn.modules import CrossMapLRN2d as SpatialCrossMapLRNOld
+
 from itertools import product as product
 from detection import Detection, MultiBoxLoss
 from prototxt import *
@@ -57,6 +63,7 @@ class CaffeData(nn.Module):
         #print('dataloader data size = %s' % (str(self.data.size())))
         return Variable(self.data), Variable(self.label)
 
+
 class FCView(nn.Module):
     def __init__(self):
         super(FCView, self).__init__()
@@ -68,6 +75,7 @@ class FCView(nn.Module):
     def __repr__(self):
         return 'view(nB, -1)'
 
+
 class Eltwise(nn.Module):
     def __init__(self, operation='+'):
         super(Eltwise, self).__init__()
@@ -78,9 +86,9 @@ class Eltwise(nn.Module):
 
     def forward(self, *inputs):
         if self.operation == '+' or self.operation == 'SUM':
-            x = inputs[0]
-            for i in range(1,len(inputs)):
-                x = x + inputs[i]
+            x = inputs[0] + inputs[1]
+            # for i in range(1,len(inputs)):
+            #     x = x + inputs[i]
         elif self.operation == '*' or self.operation == 'MUL':
             x = inputs[0]
             for i in range(1,len(inputs)):
@@ -97,6 +105,7 @@ class Eltwise(nn.Module):
             print('forward Eltwise, unknown operator')
         return x
 
+
 class Scale(nn.Module):
     def __init__(self, channels):
         super(Scale, self).__init__()
@@ -110,11 +119,17 @@ class Scale(nn.Module):
     def forward(self, x):
         nB = x.size(0)
         nC = x.size(1)
-        nH = x.size(2)
-        nW = x.size(3)
-        x = x * self.weight.view(1, nC, 1, 1).expand(nB, nC, nH, nW) + \
-            self.bias.view(1, nC, 1, 1).expand(nB, nC, nH, nW)
-        return x
+
+        ## 针对 fc 层后面 加 BN 层问题
+        if len(x.size()) < 3:
+            x1 = x * self.weight.view(1, nC).expand(nB, nC) + self.bias.view(1, nC).expand(nB, nC)
+        else:
+            nH = x.size(2)
+            nW = x.size(3)
+            x1 = x * self.weight.view(1, nC, 1, 1).expand(nB, nC, nH, nW) + self.bias.view(1, nC, 1, 1).expand(nB, nC, nH, nW)
+        return x1
+
+
 
 class Crop(nn.Module):
     def __init__(self, axis, offset):
@@ -131,6 +146,7 @@ class Crop(nn.Module):
             indices = x.data.new().resize_(indices.size()).copy_(indices)
             x = x.index_select(axis, Variable(indices))
         return x
+
 
 class Slice(nn.Module):
    def __init__(self, axis, slice_points):
@@ -156,6 +172,7 @@ class Slice(nn.Module):
            outputs.append(y)
        return tuple(outputs)
 
+
 class Concat(nn.Module):
     def __init__(self, axis):
         super(Concat, self).__init__()
@@ -166,6 +183,7 @@ class Concat(nn.Module):
 
     def forward(self, *inputs):
         return torch.cat(inputs, self.axis)
+
 
 class Permute(nn.Module):
     def __init__(self, order0, order1, order2, order3):
@@ -182,6 +200,7 @@ class Permute(nn.Module):
         x = x.permute(self.order0, self.order1, self.order2, self.order3).contiguous()
         return x
 
+
 class Softmax(nn.Module):
     def __init__(self, axis):
         super(Softmax, self).__init__()
@@ -194,9 +213,13 @@ class Softmax(nn.Module):
         assert(self.axis == len(x.size())-1)
         orig_size = x.size()        
         dims = x.size(self.axis)
-        x = F.softmax(x.view(-1, dims))
+
+        # x = F.softmax(x.view(-1, dims))
+        x = F.softmax(x.view(-1, dims), dim=1)
+
         x = x.view(*orig_size)
         return x
+
 
 class SoftmaxWithLoss(nn.CrossEntropyLoss):
     def __init__(self):
@@ -227,6 +250,7 @@ class Normalize(nn.Module):
         x = x / norm * self.weight.view(1,-1,1,1)
         return x
 
+
 class Flatten(nn.Module):
     def __init__(self, axis):
         super(Flatten, self).__init__()
@@ -241,6 +265,7 @@ class Flatten(nn.Module):
             left_size = x.size(i) * left_size
         return x.view(left_size, -1).contiguous()
 
+
 # function interface, internal, do not use this one!!!
 class LRNFunc(Function):
     def __init__(self, size, alpha=1e-4, beta=0.75, k=1):
@@ -252,6 +277,7 @@ class LRNFunc(Function):
 
     def forward(self, input):
         self.save_for_backward(input)
+        # def __init__(self, size: int, alpha: float = 1e-4, beta: float = 0.75, k: float = 1) -> None:
         self.lrn = SpatialCrossMapLRNOld(self.size, self.alpha, self.beta, self.k)
         self.lrn.type(input.type())
         return self.lrn.forward(input)
@@ -276,6 +302,7 @@ class LRN(nn.Module):
     def forward(self, input):
         return LRNFunc(self.size, self.alpha, self.beta, self.k)(input)
 
+
 class Reshape(nn.Module):
     def __init__(self, dims):
         super(Reshape, self).__init__()
@@ -291,6 +318,7 @@ class Reshape(nn.Module):
         
         return x.view(*new_dims).contiguous()
 
+
 class Accuracy(nn.Module):
     def __init__(self):
         super(Accuracy, self).__init__()
@@ -304,6 +332,7 @@ class Accuracy(nn.Module):
         print('accuracy = %f', accuracy)
         accuracy = output.data.new().resize_(1).fill_(accuracy)
         return Variable(accuracy)
+
 
 class PriorBox(nn.Module):
     """Compute priorbox coordinates in center-offset form for each source
@@ -371,6 +400,7 @@ class PriorBox(nn.Module):
             return Variable(output.cuda(device_id))
         else:
             return Variable(output)
+
 
 class CaffeNet(nn.Module):
     def __init__(self, protofile, width=None, height=None, channels=None, omit_data_layer=False, phase='TRAIN'):
@@ -468,7 +498,6 @@ class CaffeNet(nn.Module):
                 nW = data.data.size(3)
                 data = data - Variable(self.mean_img.view(1, nC, nH, nW).expand(nB, nC, nH, nW))
 
-        
         layers = self.net_info['layers']
         layer_num = len(layers)
         i = 0
@@ -482,8 +511,15 @@ class CaffeNet(nn.Module):
                 if phase != self.phase:
                     i = i + 1
                     continue
+            
             ltype = layer['type']
             tname = layer['top']
+
+            ################ 生成pytorch 时将 caffe 的scale 合并到 BN层 中 ###########
+            if ltype == 'Scale':
+                i += 1
+                continue
+            
             tnames = tname if type(tname) == list else [tname]
             if ltype in ['Data', 'AnnotatedData']:
                 if (not self.omit_data_layer) and (not self.forward_net_only):
@@ -511,25 +547,34 @@ class CaffeNet(nn.Module):
                 print(lname)
                 exit(0)
             bnames = bname if type(bname) == list else [bname]
+
             if True:
                 bdatas = [self.blobs[name] for name in bnames]
+                
                 tdatas = self._modules[lname](*bdatas)
                 if type(tdatas) != tuple:
                     tdatas = (tdatas,)
 
                 assert(len(tdatas) == len(tnames))
+                
                 for index, tdata in enumerate(tdatas):
                     self.blobs[tnames[index]] = tdata
+                
+                
                 if ltype in ['SoftmaxWithLoss', 'MultiBoxLoss']:
                     if self.output_loss != None:
                         self.output_loss += tdatas[0]
                     else:
                         self.output_loss = tdatas[0]
                 i = i + 1
+
             input_size = self.blobs[bnames[0]].size()
             output_size = self.blobs[tnames[0]].size()
+
             if self.verbose:
                 print('forward %-30s %s -> %s' % (lname, list(input_size), list(output_size)))
+
+
 
         #for name, blob in self.blobs.items():
         #    print('%s device = %d' % (name, blob.data.get_device()))
@@ -623,16 +668,38 @@ class CaffeNet(nn.Module):
                     self.models[lname].bias.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[1].data)))
                     #print("convlution %s has bias" % lname)
                 i = i + 1
+            
+            ################ 生成pytorch 时将 caffe 的scale 合并到 BN层 中 ###########
             elif ltype == 'BatchNorm':
                 print('load weights %s' % lname)
                 self.models[lname].running_mean.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data) / lmap[lname].blobs[2].data[0]))
                 self.models[lname].running_var.copy_(torch.from_numpy(np.array(lmap[lname].blobs[1].data) / lmap[lname].blobs[2].data[0]))
                 i = i + 1
-            elif ltype == 'Scale':
-                print('load weights %s' % lname)
-                self.models[lname].weight.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data)))
-                self.models[lname].bias.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[1].data)))
-                i = i + 1
+
+                ## 把scale 权值 赋值到BN层 权值
+                layer = layers[i]
+                lname2 = layer['name']
+                ltype = layer['type']
+                if ltype == 'Scale':
+                    print('load weights %s' % lname2)
+                    self.models[lname].weight.data.copy_(torch.from_numpy(np.array(lmap[lname2].blobs[0].data)))
+                    self.models[lname].bias.data.copy_(torch.from_numpy(np.array(lmap[lname2].blobs[1].data)))
+                    i = i + 1
+
+                # print(1,  lname)
+                # print(2,  self.models[lname])
+                # print(3,  dir(self.models[lname]))
+                # print(4, self.models[lname].running_mean)
+                # print(5, self.models[lname].running_var)
+                # print(6, self.models[lname].weight)
+                # print(7, self.models[lname].bias)
+            # elif ltype == 'Scale':
+            #     print('load weights %s' % lname)
+            #     self.models[lname].weight.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data)))
+            #     self.models[lname].bias.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[1].data)))
+            #     i = i + 1
+            ################ 生成pytorch 时将 caffe 的scale 合并到 BN层 中 ###########
+                
             elif ltype == 'Normalize':
                 print('load weights %s' % lname)
                 self.models[lname].weight.data.copy_(torch.from_numpy(np.array(lmap[lname].blobs[0].data)))
@@ -700,6 +767,7 @@ class CaffeNet(nn.Module):
         while i < layer_num:
             layer = layers[i]
             lname = layer['name']
+
             if 'include' in layer and 'phase' in layer['include']:
                 phase = layer['include']['phase']
                 lname = lname + '.' + phase
@@ -746,19 +814,30 @@ class CaffeNet(nn.Module):
                 momentum = 0.9
                 if 'batch_norm_param' in layer and 'moving_average_fraction' in layer['batch_norm_param']:
                     momentum = float(layer['batch_norm_param']['moving_average_fraction'])
+                
                 channels = blob_channels[bname]
-                models[lname] = nn.BatchNorm2d(channels, momentum=momentum, affine=False)
+
+                ####### FC层 后面 接 1维 BN层 问题
+                if blob_height[tname]==1 and blob_height[bname] ==1:
+                    models[lname] = nn.BatchNorm1d(channels, momentum=momentum, affine=True)
+                else:
+                    models[lname] = nn.BatchNorm2d(channels, momentum=momentum, affine=True)
+
                 blob_channels[tname] = channels
                 blob_width[tname] = blob_width[bname]
                 blob_height[tname] = blob_height[bname]
+
                 i = i + 1
+
+            ################ 生成pytorch 时将 caffe 的scale 合并到 BN层 中 ###########
             elif ltype == 'Scale':
-                channels = blob_channels[bname]
-                models[lname] = Scale(channels)
-                blob_channels[tname] = channels
-                blob_width[tname] = blob_width[bname]
-                blob_height[tname] = blob_height[bname]
+                # channels = blob_channels[bname]
+                # models[lname] = Scale(channels)
+                # blob_channels[tname] = channels
+                # blob_width[tname] = blob_width[bname]
+                # blob_height[tname] = blob_height[bname]
                 i = i + 1
+
             elif ltype == 'ReLU':
                 inplace = (bname == tname)
                 if 'relu_param' in layer and 'negative_slope' in layer['relu_param']:
@@ -1001,6 +1080,7 @@ class CaffeNet(nn.Module):
             input_width = blob_width[bname] if type(bname) != list else blob_width[bname[0]]
             input_height = blob_height[bname] if type(bname) != list else blob_height[bname[0]]
             input_channels = blob_channels[bname] if type(bname) != list else blob_channels[bname[0]]
+            
             output_width = blob_width[tname] if type(tname) != list else blob_width[tname[0]]
             output_height = blob_height[tname] if type(tname) != list else blob_height[tname[0]]
             output_channels = blob_channels[tname] if type(tname) != list else blob_channels[tname[0]]
